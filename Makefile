@@ -1,7 +1,7 @@
-all: kaleidoscope.o
+all: kaleidoscope
 
-kaleidoscope.o: kaleidoscope.cpp
-	g++ -c kaleidoscope.cpp
+kaleidoscope: kaleidoscope.cpp
+	clang++ -std=c++14 -g kaleidoscope.cpp -o kaleidoscope
 
 clean:
 	rm kaleidoscope.o
