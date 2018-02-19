@@ -1,3 +1,6 @@
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -83,6 +86,7 @@ static int gettok() {
 class ExprAST {
 public:
   virtual ~ExprAST() {}
+  virtual llvm::Value *codegen() = 0;
 };
 
 /// NumberExprAST - Expression class for numeric literals like "1.0".
@@ -91,6 +95,7 @@ class NumberExprAST : public ExprAST {
 
 public:
   NumberExprAST(double Val) : Val(Val) {}
+  virtual llvm::Value *codegen();
 };
 
 /// VariableExprAST - Expression class for referencing a variable, like "a".
@@ -99,6 +104,7 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  virtual llvm::Value *codegen();
 };
 
 /// BinaryExprAST - Expression class for a binary operator.
@@ -110,6 +116,7 @@ public:
   BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+  virtual llvm::Value *codegen();
 };
 
 /// CallExprAST - Expression class for function calls.
@@ -121,6 +128,7 @@ public:
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
+  virtual llvm::Value *codegen();
 };
 
 /// PrototypeAST - This class represents the "prototype" for a function,
@@ -133,8 +141,10 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &Name, std::vector<std::string> Args)
       : Name(Name), Args(std::move(Args)) {}
+  llvm::Function *codegen();
 
   const std::string &getName() const { return Name; }
+  const std::string &getArgName(int i) const { return Args[i]; }
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -146,6 +156,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+  llvm::Function *codegen();
 };
 
 //===----------------------------------------------------------------------===//
@@ -353,10 +364,132 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make an anonymous proto.
-    auto Proto =
-        std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Code generation to LLVM IR
+//===----------------------------------------------------------------------===//
+static llvm::LLVMContext TheContext;
+static llvm::IRBuilder<> Builder(TheContext);
+static std::unique_ptr<llvm::Module> TheModule;
+static std::map<std::string, llvm::Value *> NamedValues;
+
+llvm::Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+llvm::Value *NumberExprAST::codegen() {
+  return llvm::ConstantFP::get(TheContext, llvm::APFloat(Val));
+}
+
+llvm::Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  llvm::Value *V = NamedValues[Name];
+  if (!V)
+    LogErrorV("Unknown variable name");
+  return V;
+}
+
+llvm::Value *BinaryExprAST::codegen() {
+  llvm::Value *L = LHS->codegen();
+  llvm::Value *R = RHS->codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case '+':
+    return Builder.CreateFAdd(L, R, "addtmp");
+  case '-':
+    return Builder.CreateFSub(L, R, "subtmp");
+  case '*':
+    return Builder.CreateFMul(L, R, "multmp");
+  case '<':
+    L = Builder.CreateFCmpULT(L, R, "cmptmp");
+    // Convert bool 0/1 to double 0.0/1.0
+    return Builder.CreateUIToFP(L, llvm::Type::getDoubleTy(TheContext),
+                                "booltmp");
+  default:
+    return LogErrorV("Invalid binary operator");
+  }
+}
+
+llvm::Value *CallExprAST::codegen() {
+  llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV("Unknown function referenced");
+
+  // If argument mismatch error.
+  if (CalleeF->arg_size() != Args.size())
+    return LogErrorV("Incorrect # arguments passed");
+
+  std::vector<llvm::Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+llvm::Function *PrototypeAST::codegen() {
+  // Make the function type: double(double,double) etc.
+  std::vector<llvm::Type *> Doubles(Args.size(),
+                                    llvm::Type::getDoubleTy(TheContext));
+  llvm::FunctionType *FT = llvm::FunctionType::get(
+      llvm::Type::getDoubleTy(TheContext), Doubles, false);
+
+  llvm::Function *F = llvm::Function::Create(
+      FT, llvm::Function::ExternalLinkage, Name, TheModule.get());
+
+  return F;
+}
+
+llvm::Function *FunctionAST::codegen() {
+  // First, check for an existing function from a previous 'extern' declaration.
+  llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+  if (!TheFunction)
+    TheFunction = Proto->codegen();
+
+  if (!TheFunction)
+    return nullptr;
+
+  if (!TheFunction->empty())
+    return (llvm::Function *)LogErrorV("Function cannot be redefined");
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &Arg : TheFunction->args())
+    Arg.setName(Proto->getArgName(Idx++));
+
+  // Create a new basic block to start instertion into.
+  llvm::BasicBlock *BB =
+      llvm::BasicBlock::Create(TheContext, "entry", TheFunction);
+  Builder.SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &Arg : TheFunction->args())
+    NamedValues[Arg.getName()] = &Arg;
+
+  if (llvm::Value *RetVal = Body->codegen()) {
+    // Finish off the function
+    Builder.CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    llvm::verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction->eraseFromParent();
   return nullptr;
 }
 
@@ -365,8 +498,12 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 //===----------------------------------------------------------------------===//
 
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definition.\n");
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read function definition: ");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -374,8 +511,12 @@ static void HandleDefinition() {
 }
 
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed an extern\n");
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST->codegen()) {
+      fprintf(stderr, "Read extern: ");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -384,8 +525,12 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level expr\n");
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read top-level expression: ");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -427,8 +572,14 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  // Make the module, which holds all the code.
+  TheModule = llvm::make_unique<llvm::Module>("Kaleidoscope", TheContext);
+
   // Run the main "interpreter loop" now.
   MainLoop();
+
+  // Print out all of the generated code.
+  TheModule->print(llvm::errs(), nullptr);
 
   return 0;
 }
