@@ -26,6 +26,13 @@ enum Token {
   // primary
   tok_identifier = -4,
   tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier
@@ -47,6 +54,16 @@ static int gettok() {
       return tok_def;
     if (IdentifierStr == "extern")
       return tok_extern;
+    if (IdentifierStr == "if")
+      return tok_if;
+    if (IdentifierStr == "then")
+      return tok_then;
+    if (IdentifierStr == "else")
+      return tok_else;
+    if (IdentifierStr == "for")
+      return tok_for;
+    if (IdentifierStr == "in")
+      return tok_in;
     return tok_identifier;
   }
 
@@ -100,7 +117,7 @@ class NumberExprAST : public ExprAST {
 
 public:
   NumberExprAST(double Val) : Val(Val) {}
-  virtual llvm::Value *codegen();
+  llvm::Value *codegen() override;
 };
 
 /// VariableExprAST - Expression class for referencing a variable, like "a".
@@ -109,7 +126,7 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
-  virtual llvm::Value *codegen();
+  llvm::Value *codegen() override;
 };
 
 /// BinaryExprAST - Expression class for a binary operator.
@@ -121,7 +138,7 @@ public:
   BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
-  virtual llvm::Value *codegen();
+  llvm::Value *codegen() override;
 };
 
 /// CallExprAST - Expression class for function calls.
@@ -133,7 +150,34 @@ public:
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
-  virtual llvm::Value *codegen();
+  llvm::Value *codegen() override;
+};
+
+/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr<ExprAST> Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then,
+            std::unique_ptr<ExprAST> Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  llvm::Value *codegen() override;
+};
+
+/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
+             std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step,
+             std::unique_ptr<ExprAST> Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
+  llvm::Value *codegen() override;
 };
 
 /// PrototypeAST - This class represents the "prototype" for a function,
@@ -242,6 +286,82 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+/// ifexpr ::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken(); // eat 'if'
+
+  // condition
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError("Expected then");
+  getNextToken(); // eat 'then'
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError("Expected else");
+
+  getNextToken(); // eat 'else'
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then),
+                                     std::move(Else));
+}
+
+/// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static std::unique_ptr<ExprAST> ParseForExpr() {
+  getNextToken(); // eat 'for'
+
+  if (CurTok != tok_identifier)
+    return LogError("Expected identifier after for");
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier
+
+  if (CurTok != '=')
+    return LogError("Expected '='");
+  getNextToken(); // eat '='
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != ',')
+    return LogError("Expected ',' after the start value");
+  getNextToken(); // eat ','
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional
+  std::unique_ptr<ExprAST> Step;
+  if (CurTok == ',') {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError("Expected 'in' after for");
+  getNextToken(); // eat 'in'
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End),
+                                      std::move(Step), std::move(Body));
+}
+
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -256,6 +376,10 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
   }
 }
 
@@ -461,6 +585,140 @@ llvm::Value *CallExprAST::codegen() {
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
+llvm::Value *IfExprAST::codegen() {
+  llvm::Value *CondV = Cond->codegen();
+
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0
+  CondV = Builder.CreateFCmpONE(
+      CondV, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "ifcond");
+
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+
+  // Create basic blocks for 'then' and 'else' cases. Insert the 'then' block at
+  // the end of the function.
+  llvm::BasicBlock *ThenBB =
+      llvm::BasicBlock::Create(TheContext, "then", TheFunction);
+  llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(TheContext, "else");
+  llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(TheContext, "ifcont");
+
+  Builder.CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value
+  Builder.SetInsertPoint(ThenBB);
+
+  llvm::Value *ThenV = Then->codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder.CreateBr(MergeBB);
+  // Codegen of 'then' can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder.GetInsertBlock();
+
+  // Emit else value
+  TheFunction->getBasicBlockList().push_back(ElseBB);
+  Builder.SetInsertPoint(ElseBB);
+
+  llvm::Value *ElseV = Else->codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder.CreateBr(MergeBB);
+  // Update ElseBB for the PHI.
+  ElseBB = Builder.GetInsertBlock();
+
+  // Emit merge
+  TheFunction->getBasicBlockList().push_back(MergeBB);
+  Builder.SetInsertPoint(MergeBB);
+  llvm::PHINode *PN =
+      Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, "iftmp");
+
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+llvm::Value *ForExprAST::codegen() {
+  // Emit the start code, without a variable in the scope.
+  llvm::Value *StartVal = Start->codegen();
+  if (!StartVal)
+    return nullptr;
+
+  // Make a new basic block for the loop header.
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  llvm::BasicBlock *PreheaderBB = Builder.GetInsertBlock();
+  llvm::BasicBlock *LoopBB =
+      llvm::BasicBlock::Create(TheContext, "loop", TheFunction);
+
+  // Insert a branch to the loop.
+  Builder.CreateBr(LoopBB);
+
+  // Start insertion in the loop.
+  Builder.SetInsertPoint(LoopBB);
+
+  // Start PHI node with an entry for Start
+  llvm::PHINode *Variable = Builder.CreatePHI(
+      llvm::Type::getDoubleTy(TheContext), 2, VarName.c_str());
+  Variable->addIncoming(StartVal, PreheaderBB);
+
+  // Within the loop, the variable is defined equal to the PHI node. If it
+  // shadows an existing variable, we have to restore it.
+  llvm::Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  // Emit the body of the Loop. This can change the current BB.
+  if (!Body->codegen())
+    return nullptr;
+
+  // Emit the step value.
+  llvm::Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step->codegen();
+    if (!StepVal)
+      return nullptr;
+  } else {
+    // if not specified, use 1.0.
+    StepVal = llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
+  }
+
+  llvm::Value *NextVar = Builder.CreateFAdd(Variable, StepVal, "nextvar");
+
+  // Compute the end condition.
+  llvm::Value *EndCond = End->codegen();
+  if (!EndCond)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder.CreateFCmpONE(
+      EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)),
+      "loopcond");
+
+  // Create the "after loop" block and instert it.
+  llvm::BasicBlock *LoopEndBB = Builder.GetInsertBlock();
+  llvm::BasicBlock *AfterLoopBB =
+      llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
+
+  // Insert the conditional branch into the end of the LoopEndBB
+  Builder.CreateCondBr(EndCond, LoopBB, AfterLoopBB);
+
+  // New code will be inserted in AfterBB.
+  Builder.SetInsertPoint(AfterLoopBB);
+
+  // Add a new entry to the PHI node
+  Variable->addIncoming(NextVar, LoopEndBB);
+
+  // Restore the unshadowed variable
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(TheContext));
+}
+
 llvm::Function *PrototypeAST::codegen() {
   // Make the function type: double(double,double) etc.
   std::vector<llvm::Type *> Doubles(Args.size(),
@@ -652,8 +910,6 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
-
-
 
 int main() {
   llvm::InitializeNativeTarget();
