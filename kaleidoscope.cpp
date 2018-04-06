@@ -1,14 +1,26 @@
-#include "KaleidoscopeJIT.h"
+// Use this macro to use JIT to evaluate the code, otherwise produce an object
+// code.
+// #define __USE_JIT
+
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/GVN.h"
 #include <map>
 #include <string>
 #include <vector>
+
+#ifdef __USE_JIT
+#include "KaleidoscopeJIT.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#else
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/TargetRegistry.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#endif
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -670,7 +682,9 @@ static llvm::IRBuilder<> Builder(TheContext);
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::AllocaInst *> NamedValues;
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+#ifdef __USE_JIT
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+#endif
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 llvm::Value *LogErrorV(const char *Str) {
@@ -1046,8 +1060,10 @@ llvm::Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     llvm::verifyFunction(*TheFunction);
 
+#ifdef __USE_JIT
     // Optimize the function.
     TheFPM->run(*TheFunction);
+#endif
 
     return TheFunction;
   }
@@ -1064,6 +1080,8 @@ llvm::Function *FunctionAST::codegen() {
 void InitializeModuleAndPassManager(void) {
   // Open a new module.
   TheModule = std::make_unique<llvm::Module>("Kaleidoscope", TheContext);
+
+#ifdef __USE_JIT
   TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
   // Create a new pass manager attached to it.
@@ -1081,6 +1099,7 @@ void InitializeModuleAndPassManager(void) {
   TheFPM->add(llvm::createCFGSimplificationPass());
 
   TheFPM->doInitialization();
+#endif
 }
 
 static void HandleDefinition() {
@@ -1089,8 +1108,10 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition: ");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+#ifdef __USE_JIT
       TheJIT->addModule(std::move(TheModule));
       InitializeModuleAndPassManager();
+#endif
     }
   } else {
     // Skip token for error recovery.
@@ -1119,6 +1140,8 @@ static void HandleTopLevelExpression() {
       fprintf(stderr, "Read top-level expression: ");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+
+#ifdef __USE_JIT
       // JIT the module containing the anonymous expression, keeping a handle so
       // we can free it later.
       auto H = TheJIT->addModule(std::move(TheModule));
@@ -1136,6 +1159,7 @@ static void HandleTopLevelExpression() {
 
       // Delete the anonymous expression module from the JIT.
       TheJIT->removeModule(H);
+#endif
     }
   } else {
     // Skip token for error recovery.
@@ -1193,9 +1217,37 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
+#ifdef __USE_JIT
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
   llvm::InitializeNativeTargetAsmParser();
+#else
+  llvm::InitializeAllTargetInfos();
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmParsers();
+  llvm::InitializeAllAsmPrinters();
+
+  auto TargetTriple = llvm::sys::getDefaultTargetTriple();
+  std::string Error;
+  auto Target = llvm::TargetRegistry::lookupTarget(TargetTriple, Error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  // This generally occurs of we've forgotten to initialise the Target Registry
+  // or we have a bogus target triple.
+  if (!Target) {
+    llvm::errs() << Error;
+    return 1;
+  }
+
+  auto CPU = "generic";
+  auto Features = "";
+
+  llvm::TargetOptions opt;
+  auto RM = llvm::Optional<llvm::Reloc::Model>();
+  auto TargetMachine =
+      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+#endif
 
   // Install standard binary operators.
   // 1 is lowest precedence.
@@ -1209,15 +1261,47 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
+#ifdef __USE_JIT
   TheJIT = std::make_unique<llvm::orc::KaleidoscopeJIT>();
+#endif
 
   InitializeModuleAndPassManager();
+
+#ifndef __USE_JIT
+  TheModule->setDataLayout(TargetMachine->createDataLayout());
+  TheModule->setTargetTriple(TargetTriple);
+#endif
 
   // Run the main "interpreter loop" now.
   MainLoop();
 
   // Print out all of the generated code.
   TheModule->print(llvm::errs(), nullptr);
+
+#ifndef __USE_JIT
+  // Emit Object code
+  auto Filename = "output.o";
+  std::error_code EC;
+  llvm::raw_fd_ostream dest(Filename, EC, llvm::sys::fs::F_None);
+
+  if (EC) {
+    llvm::errs() << "Could not open file: " << EC.message();
+    return 1;
+  }
+
+  llvm::legacy::PassManager pass;
+  auto FileType = llvm::TargetMachine::CGFT_ObjectFile;
+
+  if (TargetMachine->addPassesToEmitFile(pass, dest, FileType)) {
+    llvm::errs() << "TargetMachine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  llvm::outs() << "Wrote " << Filename << "\n";
+#endif
 
   return 0;
 }
