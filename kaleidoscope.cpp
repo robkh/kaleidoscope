@@ -1,18 +1,18 @@
 // Use this macro to generate DWARF
-#define __GENERATE_DWARF
+//#define __GENERATE_DWARF
 
 #ifndef __GENERATE_DWARF
 // Use this macro to turn on Command Line Interface
-// #define __USE_CLI
+#define __USE_CLI
 
-// Use this macro to turn on optimizations
-// #define __USE_OPT_PASSES
+// Use this macro to turn on FPM optimizations
+//#define __USE_FPM_PASSES
 #endif
 
 #ifdef __USE_CLI
 // Use this macro to use JIT to evaluate the code, otherwise produce an object
 // code.
-// #define __USE_JIT
+#define __USE_JIT
 #endif
 
 #include "llvm/IR/IRBuilder.h"
@@ -376,6 +376,14 @@ public:
 
   unsigned getBinaryPrecedence() const { return Precedence; }
   int getLine() const { return Line; }
+
+  llvm::raw_ostream &dump(llvm::raw_ostream &out, int ind) {
+    indent(out, ind) << "PrototypeAST " << Name << "\n";
+    ++ind;
+    for (const auto &Arg : Args)
+      indent(out, ind) << Arg << ':';
+    return out;
+  }
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -392,6 +400,7 @@ public:
   llvm::raw_ostream &dump(llvm::raw_ostream &out, int ind) {
     indent(out, ind) << "FunctionAST\n";
     ++ind;
+    Proto->dump(out, ind);
     indent(out, ind) << "Body:";
     return Body ? Body->dump(out, ind) : out << "null\n";
   }
@@ -777,8 +786,8 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   if (Kind && ArgNames.size() != Kind)
     return LogErrorP("Invalid number of operands for opeator");
 
-  return std::make_unique<PrototypeAST>(FnLoc, FnName, ArgNames, Kind != 0,
-                                        BinaryPrecedence);
+  return std::make_unique<PrototypeAST>(FnLoc, FnName, std::move(ArgNames),
+                                        Kind != 0, BinaryPrecedence);
 }
 
 /// definition ::= 'def' prototype expression
@@ -864,7 +873,9 @@ void DebugInfo::emitLocation(ExprAST *AST) {
 //===----------------------------------------------------------------------===//
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::AllocaInst *> NamedValues;
+#ifdef __USE_FPM_PASSES
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+#endif
 #ifdef __USE_JIT
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 #endif
@@ -1314,7 +1325,7 @@ llvm::Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     llvm::verifyFunction(*TheFunction);
 
-#ifdef __USE_JIT
+#ifdef __USE_FPM_PASSES
     // Optimize the function.
     TheFPM->run(*TheFunction);
 #endif
@@ -1338,10 +1349,10 @@ void InitializeModuleAndPassManager(void) {
 #ifdef __USE_JIT
   TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
+#ifdef __USE_FPM_PASSES
   // Create a new pass manager attached to it.
   TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
 
-#ifdef __USE_OPT_PASSES
   // Promote allocas to registers.
   TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
   // Do simple "peephole" optimizations and bit-twiddling optzns.
@@ -1352,9 +1363,9 @@ void InitializeModuleAndPassManager(void) {
   TheFPM->add(llvm::createGVNPass());
   // Simplify the control flow graph (deleting unreachable blocks, etc).
   TheFPM->add(llvm::createCFGSimplificationPass());
-#endif
 
   TheFPM->doInitialization();
+#endif
 #endif
 }
 
@@ -1370,9 +1381,10 @@ static void HandleDefinition() {
       InitializeModuleAndPassManager();
 #endif
     }
-#endif
+#else
     if (!FnAST->codegen())
       fprintf(stderr, "Error reading function definition:");
+#endif
   } else {
     // Skip token for error recovery.
     getNextToken();
