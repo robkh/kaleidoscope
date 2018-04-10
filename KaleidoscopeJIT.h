@@ -14,21 +14,25 @@
 #ifndef LLVM_EXECUTIONENGINE_ORC_KALEIDOSCOPEJIT_H
 #define LLVM_EXECUTIONENGINE_ORC_KALEIDOSCOPEJIT_H
 
-#include "llvm/ADT/iterator_range.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
-#include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
-#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
+#include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/ExecutionEngine/Orc/LambdaResolver.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -42,11 +46,17 @@ public:
   using ObjLayerT = RTDyldObjectLinkingLayer;
   using CompileLayerT = IRCompileLayer<ObjLayerT, SimpleCompiler>;
   using ModuleHandleT = CompileLayerT::ModuleHandleT;
+  using OptimizeFunction =
+      std::function<std::shared_ptr<Module>(std::shared_ptr<Module>)>;
+  using TransformLayerT = IRTransformLayer<CompileLayerT, OptimizeFunction>;
 
   KaleidoscopeJIT()
       : TM(EngineBuilder().selectTarget()), DL(TM->createDataLayout()),
         ObjectLayer([]() { return std::make_shared<SectionMemoryManager>(); }),
-        CompileLayer(ObjectLayer, SimpleCompiler(*TM)) {
+        CompileLayer(ObjectLayer, SimpleCompiler(*TM)),
+        OptimizeLayer(CompileLayer, [this](std::shared_ptr<Module> M) {
+          return optimizeModule(std::move(M));
+        }) {
     llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
   }
 
@@ -58,13 +68,13 @@ public:
     // JIT.
     auto Resolver = createLambdaResolver(
         [&](const std::string &Name) {
-          if (auto Sym = findMangledSymbol(Name))
+          if (auto Sym = OptimizeLayer.findSymbol(Name, false))
             return Sym;
           return JITSymbol(nullptr);
         },
         [](const std::string &S) { return nullptr; });
-    auto H = cantFail(CompileLayer.addModule(std::move(M),
-                                             std::move(Resolver)));
+    auto H =
+        cantFail(OptimizeLayer.addModule(std::move(M), std::move(Resolver)));
 
     ModuleHandles.push_back(H);
     return H;
@@ -72,7 +82,7 @@ public:
 
   void removeModule(ModuleHandleT H) {
     ModuleHandles.erase(find(ModuleHandles, H));
-    cantFail(CompileLayer.removeModule(H));
+    cantFail(OptimizeLayer.removeModule(H));
   }
 
   JITSymbol findSymbol(const std::string Name) {
@@ -107,7 +117,7 @@ private:
     // This is the opposite of the usual search order for dlsym, but makes more
     // sense in a REPL where we want to bind to the newest available definition.
     for (auto H : make_range(ModuleHandles.rbegin(), ModuleHandles.rend()))
-      if (auto Sym = CompileLayer.findSymbolIn(H, Name, ExportedSymbolsOnly))
+      if (auto Sym = OptimizeLayer.findSymbolIn(H, Name, ExportedSymbolsOnly))
         return Sym;
 
     // If we can't find the symbol in the JIT, try looking in the host process.
@@ -127,10 +137,29 @@ private:
     return nullptr;
   }
 
+  std::shared_ptr<Module> optimizeModule(std::shared_ptr<Module> M) {
+    // create a function pass manager
+    auto FPM = std::make_unique<legacy::FunctionPassManager>(M.get());
+
+    // Add some optimizations.
+    FPM->add(createInstructionCombiningPass());
+    FPM->add(createReassociatePass());
+    FPM->add(createGVNPass());
+    FPM->add(createCFGSimplificationPass());
+    FPM->doInitialization();
+
+    // Run the optimizations.
+    for (auto &F : *M)
+      FPM->run(F);
+
+    return M;
+  }
+
   std::unique_ptr<TargetMachine> TM;
   const DataLayout DL;
   ObjLayerT ObjectLayer;
   CompileLayerT CompileLayer;
+  TransformLayerT OptimizeLayer;
   std::vector<ModuleHandleT> ModuleHandles;
 };
 
