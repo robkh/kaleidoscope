@@ -18,6 +18,7 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
@@ -45,18 +46,28 @@ class KaleidoscopeJIT {
 public:
   using ObjLayerT = RTDyldObjectLinkingLayer;
   using CompileLayerT = IRCompileLayer<ObjLayerT, SimpleCompiler>;
-  using ModuleHandleT = CompileLayerT::ModuleHandleT;
   using OptimizeFunction =
       std::function<std::shared_ptr<Module>(std::shared_ptr<Module>)>;
   using TransformLayerT = IRTransformLayer<CompileLayerT, OptimizeFunction>;
+  using CODLayerT = CompileOnDemandLayer<TransformLayerT>;
+  using CompileCBManagerT = JITCompileCallbackManager;
+  using ModuleHandleT = CODLayerT::ModuleHandleT;
 
   KaleidoscopeJIT()
       : TM(EngineBuilder().selectTarget()), DL(TM->createDataLayout()),
         ObjectLayer([]() { return std::make_shared<SectionMemoryManager>(); }),
         CompileLayer(ObjectLayer, SimpleCompiler(*TM)),
-        OptimizeLayer(CompileLayer, [this](std::shared_ptr<Module> M) {
-          return optimizeModule(std::move(M));
-        }) {
+        OptimizeLayer(CompileLayer,
+                      [this](std::shared_ptr<Module> M) {
+                        return optimizeModule(std::move(M));
+                      }),
+        CompileCallbackManager(
+            orc::createLocalCompileCallbackManager(TM->getTargetTriple(), 0)),
+        CODLayer(OptimizeLayer,
+                 [this](Function &F) { return std::set<Function *>({&F}); },
+                 *CompileCallbackManager,
+                 orc::createLocalIndirectStubsManagerBuilder(
+                     TM->getTargetTriple())) {
     llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
   }
 
@@ -68,13 +79,12 @@ public:
     // JIT.
     auto Resolver = createLambdaResolver(
         [&](const std::string &Name) {
-          if (auto Sym = OptimizeLayer.findSymbol(Name, false))
+          if (auto Sym = CODLayer.findSymbol(Name, false))
             return Sym;
           return JITSymbol(nullptr);
         },
         [](const std::string &S) { return nullptr; });
-    auto H =
-        cantFail(OptimizeLayer.addModule(std::move(M), std::move(Resolver)));
+    auto H = cantFail(CODLayer.addModule(std::move(M), std::move(Resolver)));
 
     ModuleHandles.push_back(H);
     return H;
@@ -82,7 +92,7 @@ public:
 
   void removeModule(ModuleHandleT H) {
     ModuleHandles.erase(find(ModuleHandles, H));
-    cantFail(OptimizeLayer.removeModule(H));
+    cantFail(CODLayer.removeModule(H));
   }
 
   JITSymbol findSymbol(const std::string Name) {
@@ -117,7 +127,7 @@ private:
     // This is the opposite of the usual search order for dlsym, but makes more
     // sense in a REPL where we want to bind to the newest available definition.
     for (auto H : make_range(ModuleHandles.rbegin(), ModuleHandles.rend()))
-      if (auto Sym = OptimizeLayer.findSymbolIn(H, Name, ExportedSymbolsOnly))
+      if (auto Sym = CODLayer.findSymbolIn(H, Name, ExportedSymbolsOnly))
         return Sym;
 
     // If we can't find the symbol in the JIT, try looking in the host process.
@@ -160,6 +170,8 @@ private:
   ObjLayerT ObjectLayer;
   CompileLayerT CompileLayer;
   TransformLayerT OptimizeLayer;
+  std::unique_ptr<CompileCBManagerT> CompileCallbackManager;
+  CODLayerT CODLayer;
   std::vector<ModuleHandleT> ModuleHandles;
 };
 
